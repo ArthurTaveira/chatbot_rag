@@ -1,0 +1,17 @@
+langchain 
+langchain_community 
+python-dotenv 
+streamlit 
+langchain_experimental 
+sentence-transformers 
+langchain_chroma
+langchainhub 
+pypdf 
+rapidocr-onnxruntime
+langchain_google_genai 
+pinecone 
+langchain-community 
+langchain-pinecone
+langchain-openai 
+boto3
+
