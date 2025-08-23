@@ -1,5 +1,3 @@
-# app.py
-
 import streamlit as st
 import os
 import boto3
@@ -13,6 +11,14 @@ from langchain.chains.retrieval import create_retrieval_chain
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import InMemoryChatMessageHistory
 import time
+import asyncio
+from langchain_core.messages import AIMessage, HumanMessage
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
+
 
 # --- Configuração da Página ---
 st.set_page_config(page_title="Assistente de Pesquisa RAG", layout="wide")
@@ -55,6 +61,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+import time
+
+def typewriter_effect(text: str, speed: float = 0.03):
+    """Mostra texto com efeito de digitação."""
+    placeholder = st.empty()
+    displayed_text = ""
+    for char in text:
+        displayed_text += char
+        placeholder.markdown(displayed_text)
+        time.sleep(speed)  # velocidade da digitação
 
 # --- Carregamento de Segredos e Configurações ---
 try:
@@ -74,10 +90,68 @@ except (KeyError, FileNotFoundError):
     st.error("⚠️ Arquivo de segredos (secrets.toml) não encontrado ou mal configurado. Por favor, siga as instruções para criar o seu.")
     st.stop()
 
+try:
+    firestore_creds = dict(st.secrets["firestore_credentials"])
+    cred = credentials.Certificate(firestore_creds)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
+    db = firestore.client()
+except Exception as e:
+    st.error(f"Falha ao conectar ao Firestore: {e}. O histórico de chat não será salvo.")
+    db = None
+
+    # --- Gerenciamento do Histórico de Conversa ---
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = []
+    # Carrega as sessões existentes do Firestore se a conexão for válida
+    if db:
+        chat_histories_ref = db.collection("chat_histories")
+        try:
+            sessions = [doc.id for doc in chat_histories_ref.stream()]
+            st.session_state.chat_sessions = sessions
+        except Exception as e:
+            st.error(f"Erro ao carregar sessões do Firestore: {e}")
+
+if "active_chat_id" not in st.session_state:
+    st.session_state.active_chat_id = None
+
+class FirestoreChatMessageHistory(BaseChatMessageHistory):
+    def __init__(self, session_id: str):
+        if not db:
+            raise ConnectionError("Cliente Firestore não inicializado.")
+        self.session_id = session_id
+        self.collection = db.collection("chat_histories")
+        self.doc_ref = self.collection.document(self.session_id)
+
+    @property
+    def messages(self) -> list[BaseMessage]:
+        doc = self.doc_ref.get()
+        if doc.exists:
+            return messages_from_dict(doc.to_dict().get("messages", []))
+        return []
+
+    def add_message(self, message: BaseMessage) -> None:
+        current_messages = self.messages
+        current_messages.append(message)
+        # Serialize each message individually before saving the list
+        serialized_messages = [message_to_dict(msg) for msg in current_messages]
+        self.doc_ref.set({"messages": serialized_messages})
+
+    def clear(self) -> None:
+        self.doc_ref.delete()
+
 
 # --- Funções em Cache para Inicialização de Serviços ---
 @st.cache_resource
 def init_services():
+    # --- INÍCIO DA CORREÇÃO ---
+    # Adicione estas linhas para criar e configurar um event loop para a thread atual
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # 'RuntimeError: There is no current event loop...'
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # --- FIM DA CORREÇÃO ---
     try:
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, max_output_tokens=None, google_api_key=GOOGLE_API_KEY)
@@ -90,8 +164,7 @@ def init_services():
         st.stop()
 
 # --- Gerenciamento do Histórico de Conversa ---
-if "store" not in st.session_state:
-    st.session_state.store = {}
+
 
 if "chat_sessions" not in st.session_state:
     st.session_state.chat_sessions = []
@@ -99,10 +172,16 @@ if "chat_sessions" not in st.session_state:
 if "active_chat_id" not in st.session_state:
     st.session_state.active_chat_id = None
 
-def get_session_history(session_id: str):
-    if session_id not in st.session_state.store:
-        st.session_state.store[session_id] = InMemoryChatMessageHistory()
-    return st.session_state.store[session_id]
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if db:
+        return FirestoreChatMessageHistory(session_id)
+    else:
+        # Fallback para memória se o Firestore falhar
+        # Isso não é ideal para produção, mas evita que o app quebre
+        st.warning("Usando histórico em memória. As conversas não serão salvas.")
+        if f"fallback_{session_id}" not in st.session_state:
+            st.session_state[f"fallback_{session_id}"] = InMemoryChatMessageHistory()
+        return st.session_state[f"fallback_{session_id}"]
 
 # --- Criação da Cadeia RAG ---
 def create_rag_chain_with_history(llm, retriever):
@@ -155,14 +234,30 @@ def generate_presigned_url(s3_client, object_key: str):
 # --- Inicialização ---
 llm, retriever, s3_client = init_services()
 
+#apagar converas
+def delete_chat_session(chat_id: str):
+    """Remove uma conversa tanto do Firestore quanto do session_state."""
+    # Apaga do Firestore
+    if db:
+        try:
+            db.collection("chat_histories").document(chat_id).delete()
+        except Exception as e:
+            st.error(f"Erro ao apagar conversa do Firestore: {e}")
+
+    # Apaga do session_state
+    if chat_id in st.session_state.chat_sessions:
+        st.session_state.chat_sessions.remove(chat_id)
+    
+    # Se a conversa apagada estava ativa, limpa o active_chat_id
+    if st.session_state.active_chat_id == chat_id:
+        st.session_state.active_chat_id = None
+
 # --- BARRA LATERAL (SIDEBAR) ---
 with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
-        # Substitua pela URL da sua logo
         st.image("logolat.png", width=120)
     with col2:
-        # Substitua pela URL da sua outra logo
         st.image("UFCG_logo.png", width=120)
 
     st.title("Minhas Conversas")
@@ -171,21 +266,31 @@ with st.sidebar:
         chat_id = f"chat_{int(time.time())}"
         st.session_state.chat_sessions.append(chat_id)
         st.session_state.active_chat_id = chat_id
-        # Inicializa com uma mensagem de boas-vindas
         get_session_history(chat_id).add_ai_message("Olá! Como posso te ajudar hoje?")
+        st.rerun() # Adicionado para atualizar a lista de chats imediatamente
 
     st.markdown("---")
 
-    # Exibe os chats existentes
-    for chat_id in reversed(st.session_state.chat_sessions):
-        # Pega a primeira mensagem do usuário para usar como título do chat
+    # --- LOOP ÚNICO E CORRIGIDO ---
+    # Itere sobre uma cópia da lista para evitar problemas ao deletar
+    for chat_id in reversed(st.session_state.chat_sessions[:]): 
         history = get_session_history(chat_id)
         chat_title = "Nova Conversa"
         if len(history.messages) > 1:
-             chat_title = history.messages[1].content[:30] + "..." # Pega os 30 primeiros caracteres da primeira pergunta
-        
-        if st.button(chat_title, key=chat_id, use_container_width=True):
-            st.session_state.active_chat_id = chat_id
+            chat_title = history.messages[1].content[:30] + "..."
+
+        # Cria as duas colunas para o título e o botão de lixeira
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            # Botão para selecionar o chat
+            if st.button(chat_title, key=f"select_{chat_id}", use_container_width=True):
+                st.session_state.active_chat_id = chat_id
+                st.rerun() # Adicionado para garantir que o chat ativo seja recarregado
+        with col2:
+            # Botão para apagar o chat
+            if st.button("🗑️", key=f"delete_{chat_id}"):
+                delete_chat_session(chat_id)
+                st.rerun() # Força a recarga da página para a lista de chats ser atualizada
 
 # --- ÁREA DE CHAT PRINCIPAL ---
 if not st.session_state.active_chat_id:
@@ -198,32 +303,49 @@ else:
     for msg in chat_history.messages:
         with st.chat_message(msg.type):
             st.markdown(msg.content)
+            # Se a mensagem for da IA e tiver fontes salvas, exiba-as
+            if msg.type == "ai" and "sources" in msg.additional_kwargs and msg.additional_kwargs["sources"]:
+                with st.expander("📚 Fontes Consultadas"):
+                    for source in msg.additional_kwargs["sources"]:
+                        if source.get("url") and source.get("filename"):
+                            st.markdown(f"- [{source['filename']}]({source['url']})")
 
     # Campo de input
     if query := st.chat_input("Pergunte algo..."):
+        # Adiciona a mensagem do usuário ao histórico (no Firestore) e exibe
+        get_session_history(active_id).add_user_message(query)
         with st.chat_message("user"):
             st.markdown(query)
 
+        # Gera e exibe a resposta da IA
         with st.chat_message("ai"):
             with st.spinner("Analisando documentos e gerando resposta..."):
                 conversational_rag_chain = create_rag_chain_with_history(llm, retriever)
                 config = {"configurable": {"session_id": active_id}}
-                
+        
                 response = conversational_rag_chain.invoke({"input": query}, config=config)
-                
+        
                 answer = response.get("answer", "Desculpe, não consegui processar sua pergunta.")
-                st.markdown(answer)
+                typewriter_effect(answer, speed=0.0)  # 🔥 efeito digitando
 
-                # Exibe as fontes
+                # Prepara e salva as fontes junto com a mensagem da IA
+                source_documents = []
                 if "context" in response and response["context"]:
+                    unique_sources = {doc.metadata.get('source') for doc in response["context"]}
+                    for source_path in unique_sources:
+                        if source_path:
+                            url, filename = generate_presigned_url(s3_client, source_path)
+                            if url:
+                                source_documents.append({"filename": filename, "url": url})
+                
+                ai_message = AIMessage(
+                    content=answer,
+                    additional_kwargs={"sources": source_documents}
+                )
+                get_session_history(active_id).add_message(ai_message)
+
+                # Exibe as fontes da resposta atual imediatamente
+                if source_documents:
                     with st.expander("📚 Fontes Consultadas"):
-                        unique_sources = {doc.metadata.get('source') for doc in response["context"]}
-                        links_gerados = 0
-                        for source_path in unique_sources:
-                            if source_path:
-                                url, filename = generate_presigned_url(s3_client, source_path)
-                                if url:
-                                    st.markdown(f"- [{filename}]({url})")
-                                    links_gerados += 1
-                        if links_gerados == 0:
-                            st.write("Nenhuma fonte válida encontrada no S3 para os documentos recuperados.")
+                        for source in source_documents:
+                            st.markdown(f"- [{source['filename']}]({source['url']})")
