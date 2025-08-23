@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-# app.py
+
 
 import streamlit as st
 import os
@@ -590,3 +589,4 @@ else:
                         if links_gerados == 0:
                             st.write("Nenhuma fonte válida encontrada no S3 para os documentos recuperados.")
 >>>>>>> d63bed1 (Novo início sem segredos)
+
