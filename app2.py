@@ -326,7 +326,7 @@ else:
                 response = conversational_rag_chain.invoke({"input": query}, config=config)
         
                 answer = response.get("answer", "Desculpe, não consegui processar sua pergunta.")
-                typewriter_effect(answer, speed=0.0)  # 🔥 efeito digitando
+                typewriter_effect(answer, speed=0.01)  # 🔥 efeito digitando
 
                 # Prepara e salva as fontes junto com a mensagem da IA
                 source_documents = []
@@ -349,3 +349,4 @@ else:
                     with st.expander("📚 Fontes Consultadas"):
                         for source in source_documents:
                             st.markdown(f"- [{source['filename']}]({source['url']})")
+
