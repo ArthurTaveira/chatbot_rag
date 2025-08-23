@@ -11,6 +11,7 @@ from langchain.chains.retrieval import create_retrieval_chain
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import InMemoryChatMessageHistory
 import time
+import asyncio
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -132,6 +133,14 @@ class FirestoreChatMessageHistory(BaseChatMessageHistory):
 # --- Funções em Cache para Inicialização de Serviços ---
 @st.cache_resource
 def init_services():
+    # --- INÍCIO DA CORREÇÃO ---
+    # Adicione estas linhas para criar e configurar um event loop para a thread atual
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # 'RuntimeError: There is no current event loop...'
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # --- FIM DA CORREÇÃO ---
     try:
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, max_output_tokens=None, google_api_key=GOOGLE_API_KEY)
