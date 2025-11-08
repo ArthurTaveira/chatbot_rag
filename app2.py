@@ -1,6 +1,14 @@
 # app.py
 
 import streamlit as st
+@@ -288,3 +289,304 @@ def generate_presigned_url(s3_client, object_key: str):
+                                    links_gerados += 1
+                        if links_gerados == 0:
+                            st.write("Nenhuma fonte válida encontrada no S3 para os documentos recuperados.")
+=======
+# app.py
+
+import streamlit as st
 import os
 import boto3
 from botocore.exceptions import NoCredentialsError
@@ -13,6 +21,14 @@ from langchain.chains.retrieval import create_retrieval_chain
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import InMemoryChatMessageHistory
 import time
+import asyncio
+
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
+
 
 # --- Configuração da Página ---
 st.set_page_config(page_title="Assistente de Pesquisa RAG", layout="wide")
@@ -74,10 +90,67 @@ except (KeyError, FileNotFoundError):
     st.error("⚠️ Arquivo de segredos (secrets.toml) não encontrado ou mal configurado. Por favor, siga as instruções para criar o seu.")
     st.stop()
 
+try:
+    firestore_creds = dict(st.secrets["firestore_credentials"])
+    cred = credentials.Certificate(firestore_creds)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
+    db = firestore.client()
+except Exception as e:
+    st.error(f"Falha ao conectar ao Firestore: {e}. O histórico de chat não será salvo.")
+    db = None
+
+    # --- Gerenciamento do Histórico de Conversa ---
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = []
+    # Carrega as sessões existentes do Firestore se a conexão for válida
+    if db:
+        chat_histories_ref = db.collection("chat_histories")
+        try:
+            sessions = [doc.id for doc in chat_histories_ref.stream()]
+            st.session_state.chat_sessions = sessions
+        except Exception as e:
+            st.error(f"Erro ao carregar sessões do Firestore: {e}")
+
+if "active_chat_id" not in st.session_state:
+    st.session_state.active_chat_id = None
+
+class FirestoreChatMessageHistory(BaseChatMessageHistory):
+    def __init__(self, session_id: str):
+        if not db:
+            raise ConnectionError("Cliente Firestore não inicializado.")
+        self.session_id = session_id
+        self.collection = db.collection("chat_histories")
+        self.doc_ref = self.collection.document(self.session_id)
+
+    @property
+    def messages(self) -> list[BaseMessage]:
+        doc = self.doc_ref.get()
+        if doc.exists:
+            return messages_from_dict(doc.to_dict().get("messages", []))
+        return []
+
+    def add_message(self, message: BaseMessage) -> None:
+        current_messages = self.messages
+        current_messages.append(message)
+        # Serialize each message individually before saving the list
+        serialized_messages = [message_to_dict(msg) for msg in current_messages]
+        self.doc_ref.set({"messages": serialized_messages})
+
+    def clear(self) -> None:
+        self.doc_ref.delete()
+
 
 # --- Funções em Cache para Inicialização de Serviços ---
 @st.cache_resource
 def init_services():
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # 'RuntimeError: There is no current event loop...'
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # --- FIM DA CORREÇÃO ---
+
     try:
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, max_output_tokens=None, google_api_key=GOOGLE_API_KEY)
@@ -90,8 +163,7 @@ def init_services():
         st.stop()
 
 # --- Gerenciamento do Histórico de Conversa ---
-if "store" not in st.session_state:
-    st.session_state.store = {}
+
 
 if "chat_sessions" not in st.session_state:
     st.session_state.chat_sessions = []
@@ -99,10 +171,16 @@ if "chat_sessions" not in st.session_state:
 if "active_chat_id" not in st.session_state:
     st.session_state.active_chat_id = None
 
-def get_session_history(session_id: str):
-    if session_id not in st.session_state.store:
-        st.session_state.store[session_id] = InMemoryChatMessageHistory()
-    return st.session_state.store[session_id]
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if db:
+        return FirestoreChatMessageHistory(session_id)
+    else:
+        # Fallback para memória se o Firestore falhar
+        # Isso não é ideal para produção, mas evita que o app quebre
+        st.warning("Usando histórico em memória. As conversas não serão salvas.")
+        if f"fallback_{session_id}" not in st.session_state:
+            st.session_state[f"fallback_{session_id}"] = InMemoryChatMessageHistory()
+        return st.session_state[f"fallback_{session_id}"]
 
 # --- Criação da Cadeia RAG ---
 def create_rag_chain_with_history(llm, retriever):
