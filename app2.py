@@ -1,14 +1,9 @@
-# app3.py (substitua o seu atual por esse)
-import os
-import asyncio
-import chainlit as cl
-import firebase_admin
-from firebase_admin import credentials, firestore
-import boto3
-from dotenv import load_dotenv
-load_dotenv()
+# app.py
 
-# LangChain imports
+import streamlit as st
+import os
+import boto3
+from botocore.exceptions import NoCredentialsError
 from langchain_pinecone import PineconeVectorStore
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -16,207 +11,219 @@ from langchain.chains.history_aware_retriever import create_history_aware_retrie
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains.retrieval import create_retrieval_chain
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
-from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict, AIMessage
+from langchain_core.chat_history import InMemoryChatMessageHistory
+import time
 
-# --- CONFIGS (via ENV) ---
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-INDEX_NAME = os.getenv("INDEX_NAME")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-S3_REGION = os.getenv("S3_REGION")
+# --- Configuração da Página ---
+st.set_page_config(page_title="Assistente de Pesquisa RAG", layout="wide")
 
-# --- FIRESTORE (tenta inicializar, mas não quebra se falhar) ---
-db = None
+# --- CSS Customizado para um Visual Profissional ---
+st.markdown("""
+<style>
+    /* Esconde o menu hamburguer e o footer do Streamlit */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+
+    /* Estilo do container principal */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        padding-left: 5rem;
+        padding-right: 5rem;
+    }
+
+    /* Estilo da barra lateral */
+    .st-emotion-cache-16txtl3 {
+        padding: 2rem 1rem;
+    }
+
+    /* Estilo dos botões de chat na sidebar */
+    .st-emotion-cache-1f1G2gn {
+        width: 100%;
+        border-radius: 0.5rem;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        background-color: transparent;
+        margin-bottom: 0.5rem;
+        text-align: left;
+        padding: 0.5rem 1rem;
+    }
+    .st-emotion-cache-1f1G2gn:hover {
+        background-color: rgba(255, 255, 255, 0.1);
+        border-color: rgba(255, 255, 255, 0.3);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# --- Carregamento de Segredos e Configurações ---
 try:
-    cred_path = os.getenv("FIRESTORE_CREDENTIALS", "firestore_credentials.json")
-    if os.path.exists(cred_path):
-        cred = credentials.Certificate(cred_path)
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print("Firestore inicializado com sucesso.")
-    else:
-        print(f"Arquivo de credenciais Firestore não encontrado em: {cred_path}")
-except Exception as e:
-    print("⚠️ Erro ao conectar ao Firestore:", e)
-    db = None
+    GOOGLE_API_KEY = st.secrets["google"]["api_key"]
+    PINECONE_API_KEY = st.secrets["pinecone"]["api_key"]
+    INDEX_NAME = st.secrets["pinecone"]["index_name"]
+    AWS_ACCESS_KEY_ID = st.secrets["aws"]["access_key_id"]
+    AWS_SECRET_ACCESS_KEY = st.secrets["aws"]["secret_access_key"]
+    S3_BUCKET_NAME = st.secrets["aws"]["s3_bucket_name"]
+    S3_REGION = st.secrets["aws"]["s3_region"]
 
-# --- Classe de histórico com fallback para memória ---
-class FirestoreChatMessageHistory(BaseChatMessageHistory):
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        if not db:
-            print("Firestore não inicializado — usando fallback InMemoryChatMessageHistory.")
-            self._use_fallback = True
-            self._fallback = InMemoryChatMessageHistory()
-            return
-        self._use_fallback = False
-        self.collection = db.collection("chat_histories")
-        self.doc_ref = self.collection.document(self.session_id)
+    os.environ['PINECONE_API_KEY'] = PINECONE_API_KEY
+    os.environ['AWS_ACCESS_KEY_ID'] = AWS_ACCESS_KEY_ID
+    os.environ['AWS_SECRET_ACCESS_KEY'] = AWS_SECRET_ACCESS_KEY
 
-    @property
-    def messages(self) -> list[BaseMessage]:
-        if self._use_fallback:
-            return self._fallback.messages
-        doc = self.doc_ref.get()
-        if doc.exists:
-            return messages_from_dict(doc.to_dict().get("messages", []))
-        return []
+except (KeyError, FileNotFoundError):
+    st.error("⚠️ Arquivo de segredos (secrets.toml) não encontrado ou mal configurado. Por favor, siga as instruções para criar o seu.")
+    st.stop()
 
-    def add_message(self, message: BaseMessage) -> None:
-        if self._use_fallback:
-            return self._fallback.add_message(message)
-        current_messages = self.messages
-        current_messages.append(message)
-        serialized = [message_to_dict(msg) for msg in current_messages]
-        self.doc_ref.set({"messages": serialized})
 
-    def clear(self) -> None:
-        if self._use_fallback:
-            return self._fallback.clear()
-        self.doc_ref.delete()
-
-# --- Inicialização segura dos serviços (retorna None em falha) ---
+# --- Funções em Cache para Inicialização de Serviços ---
+@st.cache_resource
 def init_services():
     try:
-        if not GOOGLE_API_KEY or not PINECONE_API_KEY or not INDEX_NAME:
-            print("Aviso: Algumas variáveis de ambiente (GOOGLE_API_KEY/PINECONE_API_KEY/INDEX_NAME) não estão definidas.")
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
-        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GOOGLE_API_KEY)
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, max_output_tokens=None, google_api_key=GOOGLE_API_KEY)
         vectorstore = PineconeVectorStore.from_existing_index(index_name=INDEX_NAME, embedding=embeddings)
         retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-        s3_client = boto3.client('s3', region_name=S3_REGION) if S3_REGION else None
-        print("Serviços inicializados: llm, retriever, s3_client (s3_client pode ser None).")
+        s3_client = boto3.client('s3', region_name=S3_REGION)
         return llm, retriever, s3_client
     except Exception as e:
-        print("Erro ao inicializar serviços (llm/retriever/s3):", e)
-        return None, None, None
+        st.error(f"Erro ao inicializar os serviços: {e}")
+        st.stop()
 
-llm, retriever, s3_client = init_services()
+# --- Gerenciamento do Histórico de Conversa ---
+if "store" not in st.session_state:
+    st.session_state.store = {}
 
-# --- Cria a cadeia RAG com histórico (segura) ---
-def create_rag_chain_with_history():
-    if llm is None or retriever is None:
-        print("llm ou retriever não inicializados — não é possível criar rag_chain.")
-        return None
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = []
 
-    history_aware_prompt = ChatPromptTemplate.from_messages([
+if "active_chat_id" not in st.session_state:
+    st.session_state.active_chat_id = None
+
+def get_session_history(session_id: str):
+    if session_id not in st.session_state.store:
+        st.session_state.store[session_id] = InMemoryChatMessageHistory()
+    return st.session_state.store[session_id]
+
+# --- Criação da Cadeia RAG ---
+def create_rag_chain_with_history(llm, retriever):
+    history_aware_retriever_prompt = ChatPromptTemplate.from_messages([
         MessagesPlaceholder("chat_history"),
         ("user", "{input}"),
-        ("user", "Dada a conversa acima, gere uma consulta de pesquisa relevante."),
+        ("user", "Dada a conversa acima, gere uma consulta de pesquisa para recuperar informações relevantes para a última pergunta."),
     ])
-    history_aware_chain = create_history_aware_retriever(llm, retriever, history_aware_prompt)
-
+    history_aware_retriever_chain = create_history_aware_retriever(llm, retriever, history_aware_retriever_prompt)
+    
     system_prompt = (
-        "Você é um assistente de pesquisa. "
-        "Responda usando apenas o contexto recuperado. "
-        "Se não souber, diga claramente. "
-        "Explique de forma textual e detalhada."
-        "\n\nContexto: {context}"
+      "Você é um assistente para tarefas de resposta a perguntas. "
+      "Use as partes do contexto recuperado para responder à pergunta. "
+      "Interprete e reformule as informações com suas próprias palavras. "
+      "Se a resposta não estiver presente no contexto, diga claramente que não sabe a resposta. "
+      "Não cite ou utilize imagens/figuras. Descreva tudo de forma textual e detalhada. "
+      "Seja sempre cordial e prestativo."
+      "\n\n"
+      "Contexto: {context}"
     )
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
     ])
-    qa_chain = create_stuff_documents_chain(llm, qa_prompt)
-    rag_chain = create_retrieval_chain(history_aware_chain, qa_chain)
+    Youtube_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever_chain, Youtube_chain)
 
     conversational_rag_chain = RunnableWithMessageHistory(
-        rag_chain,
-        lambda session_id: FirestoreChatMessageHistory(session_id),
+        rag_chain, get_session_history,
         input_messages_key="input",
         history_messages_key="chat_history",
         output_messages_key="answer",
     )
     return conversational_rag_chain
 
-rag_chain = create_rag_chain_with_history()
-
-# --- Função para gerar links S3 (verifica s3_client) ---
-def generate_presigned_url(object_key: str):
-    if not s3_client:
-        return None, None
+# --- Função para Links S3 ---
+def generate_presigned_url(s3_client, object_key: str):
     clean_key = os.path.basename(object_key).replace('.md', '.pdf')
     try:
-        url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET_NAME, 'Key': clean_key}, ExpiresIn=3600)
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': S3_BUCKET_NAME, 'Key': clean_key},
+            ExpiresIn=3600
+        )
         return url, clean_key
-    except Exception as e:
-        print("Erro ao gerar presigned URL:", e)
+    except Exception:
         return None, None
 
-# --- Events Chainlit ---
-@cl.on_chat_start
-async def start_chat():
-    await cl.Message(content="👋 Olá! Como posso te ajudar hoje?").send()
+# --- Inicialização ---
+llm, retriever, s3_client = init_services()
 
-@cl.on_message
-async def main(message):
-    # Se o Chainlit passar um objeto Message, pega o texto; se passar string, usa direto
-    if hasattr(message, "content"):
-        query = message.content
-    elif isinstance(message, str):
-        query = message
-    else:
-        # fallback seguro
-        query = str(message)
+# --- BARRA LATERAL (SIDEBAR) ---
+with st.sidebar:
+    col1, col2 = st.columns(2)
+    with col1:
+        # Substitua pela URL da sua logo
+        st.image("logolat.png", width=120)
+    with col2:
+        # Substitua pela URL da sua outra logo
+        st.image("UFCG_logo.png", width=120)
 
-    # sanity-check de inicialização
-    if rag_chain is None:
-        await cl.Message(content="O sistema RAG não foi inicializado corretamente. Verifique os logs no terminal.").send()
-        return
+    st.title("Minhas Conversas")
 
-    session_id = cl.user_session.get("id", "default")
-    print(f"Recebida pergunta (session_id={session_id}): {query}")
+    if st.button("💬 + Novo Chat", use_container_width=True):
+        chat_id = f"chat_{int(time.time())}"
+        st.session_state.chat_sessions.append(chat_id)
+        st.session_state.active_chat_id = chat_id
+        # Inicializa com uma mensagem de boas-vindas
+        get_session_history(chat_id).add_ai_message("Olá! Como posso te ajudar hoje?")
 
-    try:
-        response = await asyncio.to_thread(
-            lambda: rag_chain.invoke({"input": query}, config={"configurable": {"session_id": session_id}})
-        )
-        print("Response recebido do rag_chain:", type(response), response.keys() if isinstance(response, dict) else "no dict")
-    except Exception as e:
-        print("Erro durante invocation do rag_chain:", e, flush=True)
-        await cl.Message(content="Ocorreu um erro interno ao gerar a resposta (veja logs no terminal).").send()
-        return
+    st.markdown("---")
 
-    if not response:
-        print("Resposta vazia do rag_chain.")
-        await cl.Message(content="Desculpe — não recebi resposta do mecanismo RAG.").send()
-        return
+    # Exibe os chats existentes
+    for chat_id in reversed(st.session_state.chat_sessions):
+        # Pega a primeira mensagem do usuário para usar como título do chat
+        history = get_session_history(chat_id)
+        chat_title = "Nova Conversa"
+        if len(history.messages) > 1:
+             chat_title = history.messages[1].content[:30] + "..." # Pega os 30 primeiros caracteres da primeira pergunta
+        
+        if st.button(chat_title, key=chat_id, use_container_width=True):
+            st.session_state.active_chat_id = chat_id
 
-    answer = response.get("answer", "Desculpe, não consegui processar sua pergunta.")
-    msg = cl.Message(content=answer)
+# --- ÁREA DE CHAT PRINCIPAL ---
+if not st.session_state.active_chat_id:
+    st.info("Selecione uma conversa ou inicie um 'Novo Chat' na barra lateral.")
+else:
+    active_id = st.session_state.active_chat_id
+    chat_history = get_session_history(active_id)
 
-    # Se houver fontes, adiciona
-    source_docs = []
-    if isinstance(response, dict) and "context" in response and response["context"]:
-        unique_sources = {getattr(doc.metadata, 'get', lambda k: None)('source') if hasattr(doc, "metadata") else doc.metadata.get('source') for doc in response["context"]}
-        # fallback mais simples se linha acima falhar:
-        try:
-            unique_sources = {doc.metadata.get('source') for doc in response["context"]}
-        except Exception:
-            unique_sources = set()
+    # Exibe as mensagens do chat ativo
+    for msg in chat_history.messages:
+        with st.chat_message(msg.type):
+            st.markdown(msg.content)
 
-        for source_path in unique_sources:
-            if source_path:
-                url, filename = generate_presigned_url(source_path)
-                if url:
-                    source_docs.append(f"[{filename}]({url})")
+    # Campo de input
+    if query := st.chat_input("Pergunte algo..."):
+        with st.chat_message("user"):
+            st.markdown(query)
 
-    if source_docs:
-        msg.elements = [cl.Text(name="📚 Fontes Consultadas", content="\n".join(source_docs))]
+        with st.chat_message("ai"):
+            with st.spinner("Analisando documentos e gerando resposta..."):
+                conversational_rag_chain = create_rag_chain_with_history(llm, retriever)
+                config = {"configurable": {"session_id": active_id}}
+                
+                response = conversational_rag_chain.invoke({"input": query}, config=config)
+                
+                answer = response.get("answer", "Desculpe, não consegui processar sua pergunta.")
+                st.markdown(answer)
 
-    # envia a mensagem
-    try:
-        await msg.send()
-    except Exception as e:
-        print("Erro ao enviar mensagem via Chainlit:", e)
-        # Tentar enviar fallback
-        try:
-            await cl.Message(content=answer).send()
-        except Exception as e2:
-            print("Erro fallback envio:", e2)
-
+                # Exibe as fontes
+                if "context" in response and response["context"]:
+                    with st.expander("📚 Fontes Consultadas"):
+                        unique_sources = {doc.metadata.get('source') for doc in response["context"]}
+                        links_gerados = 0
+                        for source_path in unique_sources:
+                            if source_path:
+                                url, filename = generate_presigned_url(s3_client, source_path)
+                                if url:
+                                    st.markdown(f"- [{filename}]({url})")
+                                    links_gerados += 1
+                        if links_gerados == 0:
+                            st.write("Nenhuma fonte válida encontrada no S3 para os documentos recuperados.")
